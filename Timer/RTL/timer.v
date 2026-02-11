@@ -439,7 +439,7 @@ begin
    if(rst_n == 1'b0)
    begin 
       tl1          <= 8'b0000_0000;
-      th1          <= 8'b0000_0000;serial_control
+      th1          <= 8'b0000_0000;
       t1_overflag  <= 1'b0;
    end
    else 
