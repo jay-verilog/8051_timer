@@ -1,31 +1,53 @@
-module timer(
-input                            clk,
-input                            rst_n,
-input                            t0_in,
-input                            t1_in,
+`include "sfr_def_addr.v"
+`include "sfr_def_bit_addr.v"
 
-input                            slave_wr,
-input                            slave_sel,
-input                            ext_trig,
-input      [REGISTER_WIDTH-1:0]  slave_wdata,
-input      [REGISTER_WIDTH-1:0]  slave_addr,
-output reg                       slave_ack,
-output reg [REGISTER_WIDTH-1:0]  slave_rdata
+module timer_controller
+(
+input                               timer_controller_clk,
+input                               timer_controller_rst_n,
+
+input                               timer_controller_t0_in,
+input                               timer_controller_t1_in,
+
+input                               timer_controller_wr_en,
+input                               timer_controller_rd_en,
+
+input                               timer_controller_sel_intrnl_reg,
+
+input                               timer_controller_ext_t0,
+input                               timer_controller_ext_t1,
+
+input                               timer_controller_int0,
+input                               timer_controller_int1,
+
+input                               timer_controller_bit_nbyte_addr,
+
+input      [ADDR_WIDTH-1:0]         timer_controller_addr,
+input      [$clog2(DATA_WIDTH)-1:0] timer_controller_bit_addr,
+
+input      [DATA_WIDTH-1:0]         timer_controller_wdata,
+output reg [DATA_WIDTH-1:0]         timer_controller_rdata,
+
+output reg                          timer_controller_t0_flag,
+output reg                          timer_controller_t1_flag
 );
+parameter DATA_WIDTH = 8;
+parameter ADDR_WIDTH = 8;
+
 parameter REGISTER_WIDTH = 8;
 parameter SP_REGISTER_DEPTH = 256;
+parameter TCON_WIDTH_TIMER = 4;
+parameter FREQ_DIVIDE_12 = 12;
 
-// ---------------------------------------------------------------SP REG ---------------------------------------------------------------------------------------------SP REG address-------------------------------
-parameter TL0_ADDR = 8'h8a;
-parameter TL1_ADDR = 8'h8b;
-parameter TH0_ADDR = 8'h8c;
-parameter TH1_ADDR = 8'h8d;
-parameter TMOD     = 8'h89;
-parameter TCON     = 8'h88;
+reg [$clog2(FREQ_DIVIDE_12):0] divide_12_freq;
+reg divide_12_clk;
 
-// timer control register
+
+
+// Timer Mode Register
 reg [REGISTER_WIDTH-1:0] tmod;
-reg [REGISTER_WIDTH-1:0] tcon;
+// Timer Control Register
+reg [(REGISTER_WIDTH/2)-1:0] tcon;
 
 // timer 0
 reg [REGISTER_WIDTH-1:0] tl0;  // lower  8 bit.
@@ -34,607 +56,480 @@ reg [REGISTER_WIDTH-1:0] th0;  // higher 8 bit.
 reg [REGISTER_WIDTH-1:0] tl1;  // lower  8 bit.
 reg [REGISTER_WIDTH-1:0] th1;  // higher 8 bit.
 
-// counter
-reg [REGISTER_WIDTH-1:0] countr_tl0_reg;
-reg [REGISTER_WIDTH-1:0] countr_th0_reg;
-reg [REGISTER_WIDTH-1:0] countr_tl1_reg;
-reg [REGISTER_WIDTH-1:0] countr_th1_reg;
+// THESE Registers for,To detect negaedge ext_int 
+reg sample_ext_countr_t0;
+reg sample_ext_countr_t1;
 
-// timer overflow
-reg t0_overflag;
-reg t1_overflag;
+reg sample_ext_countr_t0_shift;
+reg sample_ext_countr_t1_shift;
 
-// counter overflow
-reg countr_t0_overflag;
-reg countr_t1_overflag;
+// START COUNTING
+reg countr_t0_flag;
+reg countr_t1_flag;
 
-// ---------------------------------------------------------------TMOD---------------------------------------------------------------------------------------------TMOD paramemter-------------------------------
+// timer overflow 
+reg t0_overflag;   
+reg t1_overflag;   
+reg th0_overflow;  //  FOR MODE 3
+
+// RUN FLAG (software gate, GATEx == 0)
+reg software_ctrl_t0;
+reg software_ctrl_t1;
+
+// RUN FLAG (hardware gate, GATEx == 1)
+reg hardware_gating_t0;
+reg hardware_gating_t1;
+
+
+
+
+// Frequency Divide By 12
+
+always @(posedge timer_controller_clk or negedge timer_controller_rst_n)
+begin
+   if(timer_controller_rst_n == 1'b0)
+   begin
+      divide_12_freq <= {$clog2(FREQ_DIVIDE_12){1'b0}};
+      divide_12_clk  <= 1'b0;
+   end
+
+   else 
+   begin
+      if(divide_12_freq == ((FREQ_DIVIDE_12 - 1'b1)))
+      begin
+         divide_12_clk  <= 1'b1;
+         divide_12_freq <= {$clog2(FREQ_DIVIDE_12){1'b0}};
+      end
+  
+      else 
+      begin
+         divide_12_clk  <=  1'b0;
+         divide_12_freq <= divide_12_freq + 1'b1;
+      end
+   end
+end
+
+
+// ---------------------------------------------------------------TMOD---------------------------------------------------------------------------------------------TMOD ---------------------------------
 // TMOD
 // -------7------------6------------5--------4-----------3-------------2------------1----------0------
 // |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
 // ---------------------------------------------------------------------------------------------------
-parameter TMOD_T0_M0 = 0;
-parameter TMOD_T0_M1 = 1;
-parameter TMOD_T0_CT = 2;
-parameter TMOD_T0_GT = 3;
-parameter TMOD_T1_M0 = 4;
-parameter TMOD_T1_M1 = 5;
-parameter TMOD_T1_CT = 6;
-parameter TMOD_T1_GT = 7;
+// M1M0 = 00 -> Mode 0 (13-bit timer)   
+// M1M0 = 01 -> Mode 1 (16-bit timer)
+// M1M0 = 10 -> Mode 2 (8-bit auto-reload)  
+// M1M0 = 11 -> Mode 3 (split 8-bit timers, T0 only)
 
-// ---------------------------------------------------------------TCON---------------------------------------------------------------------------------------------TCON paramemter-------------------------------
+
+// ---------------------------------------------------------------TCON---------------------------------------------------------------------------------------------TCON -------------------------------
 // -------7------------6------------5--------4-----------3-------------2------------1----------0------
 // |     TF1	 |     TR1   |	   TF0	 |  TR0	   |    IE1     |     IT1      |   IE0   |    IT0    |
 // ---------------------------------------------------------------------------------------------------
 // |------------------- USED ----------------------|--------------- UNUSED --------------------------|
-parameter TCON_TF1 = 7;
-parameter TCON_TR1 = 6;
-parameter TCON_TF0 = 5;
-parameter TCON_TR0 = 4;
+//                                                 |-------------- INTERRUPT ------------------------|
 
 
-// ---------------------------------------------------------------TMOD---------------------------------------------------------------------------------------------TMOD always block-------------------------------
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
- 
-always @(posedge clk or negedge rst_n)
-begin 
-   if(rst_n == 1'b0)
+// ---------------------------------------------------------------TMOD---------------------------------------------------------------------------------------------TMOD always block -------------------------------
+
+always @(posedge timer_controller_clk or negedge timer_controller_rst_n)
+begin
+   if(timer_controller_rst_n == 1'b0)
    begin
-      tmod <= 8'b0000_0000;
-   end 
-   else 
+      tmod <= {REGISTER_WIDTH{1'b0}};
+   end
+   else
    begin
-      if(slave_wr == 1'b1 && slave_sel == 1'b1 && slave_addr == TMOD)
+      if(timer_controller_wr_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1 && timer_controller_addr == `TMOD)
       begin
-         tmod <= slave_wdata;
+         tmod <= timer_controller_wdata;
       end
-   end 
+   end
 end
 
 
-// ---------------------------------------------------------------TCON---------------------------------------------------------------------------------------------TCON always block------------------------------
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |     TF1	 |     TR1   |	   TF0	 |  TR0	   |    IE1     |     IT1      |   IE0   |    IT0    |
-// ---------------------------------------------------------------------------------------------------
- 
-always @(posedge clk or negedge rst_n)
-begin 
- if(rst_n == 1'b0)
+
+
+always @(posedge timer_controller_clk or negedge timer_controller_rst_n)
+begin
+ if(timer_controller_rst_n == 1'b0)
    begin
-      tcon  <= 8'b0000_0000;
-   end 
-   else 
+      tcon  <= {(REGISTER_WIDTH/2){1'b0}};
+   end
+   else
    begin
-      if((slave_wr == 1'b1 && slave_sel == 1'b1) && slave_addr == TCON)
+      if(!timer_controller_bit_nbyte_addr && ((timer_controller_wr_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1) && timer_controller_addr == `TCON))
       begin
-         tcon <= slave_wdata;
+         tcon <= timer_controller_wdata[7:4];
       end
-      else if(t1_overflag == 1'b1 || countr_t1_overflag == 1'b1)
+
+      else if(timer_controller_bit_nbyte_addr && ((timer_controller_wr_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1) && timer_controller_addr == `TCON) && (timer_controller_bit_addr > (TCON_WIDTH_TIMER-1)))
       begin
-         tcon[TCON_TF1] <= 1'b1;
+         tcon[timer_controller_bit_addr-TCON_WIDTH_TIMER] <= timer_controller_wdata[0];
       end
-      else if(t0_overflag == 1'b1 || countr_t0_overflag == 1'b1)
-      begin         
-         tcon[TCON_TF0] <= 1'b1;
-      end   
-   end 
+
+      else
+      begin
+         if(t0_overflag)
+         begin
+            tcon[`TF0-TCON_WIDTH_TIMER] <= 1'b1;
+         end
+
+         if((tmod[`T0M1] == 1'b1) && (tmod[`T0M0] == 1'b1))
+         begin
+            // Timer0 Mode 3 
+            if(th0_overflow)
+            begin
+               tcon[`TF1-TCON_WIDTH_TIMER] <= 1'b1;
+            end
+         end
+         else
+         begin
+            // Normal case 
+            if(t1_overflag)
+            begin
+               tcon[`TF1-TCON_WIDTH_TIMER] <= 1'b1;
+            end
+         end
+      end
+
+   end
 end
 
-//----------------------------------------Timer 0 ------------------------------------------------------------------------------------------------------------------------------ Timer 1 BEGIN-----------------------
 
-//---------------------------------------- Counter 0 ---- c/t  = 1 ------------------------------------------------------------------------------------------------------- Counter 0 always block-----------------------
 
-always @(posedge t0_in or negedge rst_n)
+always @(*)
 begin
-   if(rst_n == 1'b0)
-   begin 
-      countr_tl0_reg      <= 8'b0000_0000;
-      countr_th0_reg      <= 8'b0000_0000;
-      countr_t0_overflag  <= 1'b0;
-     
-   end
-   else 
-   begin 
-//    GATE = 1, C/T = 1, M1 = 0, M0 = 0
-      if((countr_t0_overflag != 1'b1) &&  (ext_trig == 1'b1 || (tcon[TCON_TR0] == 1'b1)) && (tmod[TMOD_T0_GT] == 1'b1) && (tmod[TMOD_T0_CT] == 1'b1) && (tmod[TMOD_T0_M1] == 1'b0) && (tmod[TMOD_T0_M0] == 1'b0))
-      begin
-         {countr_t0_overflag,countr_th0_reg,countr_tl0_reg} <= {countr_th0_reg,countr_tl0_reg} + 4'b1000;
-      end
-
-//    GATE = 1, C/T = 1, M1 = 0, M0 = 1     
-      else if((countr_t0_overflag != 1'b1) && (ext_trig == 1'b1 || (tcon[TCON_TR0] == 1'b1)) && (tmod[TMOD_T0_GT] == 1'b1) && (tmod[TMOD_T0_CT] == 1'b1) && (tmod[TMOD_T0_M1] == 1'b0) && (tmod[TMOD_T0_M0] == 1'b1))
-      begin
-         {countr_t0_overflag,countr_th0_reg,countr_tl0_reg} <= {countr_th0_reg,countr_tl0_reg} + 1'b1;
-      end
-
-//    GATE = 1, C/T = 1, M1 = 1, M0 = 0     
-      else if((countr_t0_overflag != 1'b1) && (ext_trig == 1'b1 || (tcon[TCON_TR0] == 1'b1)) && (tmod[TMOD_T0_GT] == 1'b1) && (tmod[TMOD_T0_CT] == 1'b1) && (tmod[TMOD_T0_M1] == 1'b1) && (tmod[TMOD_T0_M0] == 1'b0))
-      begin
-         countr_tl0_reg                      <= countr_tl0_reg + 1'b1;
-         {countr_t0_overflag,countr_th0_reg} <= countr_tl0_reg + 1'b1;
-      end
-
-//    GATE = 0, C/T = 1, M1 = 0, M0 = 0
-      else if((countr_t0_overflag != 1'b1) && (tcon[TCON_TR0] == 1'b1) && (tmod[TMOD_T0_GT] == 1'b0) && (tmod[TMOD_T0_CT] == 1'b1) && (tmod[TMOD_T0_M1] == 1'b0) && (tmod[TMOD_T0_M0] == 1'b0))
-      begin
-         {countr_t0_overflag,countr_th0_reg,countr_tl0_reg} <= {countr_th0_reg,countr_tl0_reg} + 4'b1000;
-      end
-
-//    GATE = 0, C/T = 1, M1 = 0, M0 = 1     
-      else if((countr_t0_overflag != 1'b1) && (tcon[TCON_TR0] == 1'b1) && (tmod[TMOD_T0_GT] == 1'b0) && (tmod[TMOD_T0_CT] == 1'b1) && (tmod[TMOD_T0_M1] == 1'b0) && (tmod[TMOD_T0_M0] == 1'b1)) 
-      begin
-         {countr_t0_overflag,countr_th0_reg,countr_tl0_reg} <= {countr_th0_reg,countr_tl0_reg} + 1'b1;    
-      end
-
-//    GATE = 0, C/T = 1, M1 = 1, M0 = 0     
-      else if((countr_t0_overflag != 1'b1) && (tcon[TCON_TR0] == 1'b1) && (tmod[TMOD_T0_GT] == 1'b0) && (tmod[TMOD_T0_CT] == 1'b1) && (tmod[TMOD_T0_M1] == 1'b1) && (tmod[TMOD_T0_M0] == 1'b0))
-      begin
-         countr_tl0_reg                      <= countr_tl0_reg + 1'b1;
-         {countr_t0_overflag,countr_th0_reg} <= countr_tl0_reg + 1'b1 ;
-      end
-
-      else if(tmod[TMOD_T0_CT] == 1'b0)
-      begin
-         countr_tl0_reg   <= 8'b0000_0000;
-         countr_th0_reg   <= 8'b0000_0000;
-      end
-     
-      else if(!countr_t0_overflag)
-      begin
-         countr_tl0_reg  <= tl0;
-         countr_th0_reg  <= th0;
-      end 
-   end
-end 
+   hardware_gating_t0 = tmod[`GATE0] & tcon[`TR0-TCON_WIDTH_TIMER] & timer_controller_int0;
+   software_ctrl_t0   = (~tmod[`GATE0]) & tcon[`TR0-TCON_WIDTH_TIMER];
+end
 
 
-//----------------------------------------Timer 0 ---- c/t  = 0------------------------------------------------------------------------------------------------------- timer 0 always block-----------------------
-
-always @(posedge clk or negedge rst_n)
+always @(*)
 begin
-   if(rst_n == 1'b0)
-   begin 
+   hardware_gating_t1 = tmod[`GATE1] & tcon[`TR1-TCON_WIDTH_TIMER] & timer_controller_int1;
+   software_ctrl_t1   = (~tmod[`GATE1]) & tcon[`TR1-TCON_WIDTH_TIMER];
+end
+
+
+// ----------------------------------------------------  EXTERNAL EVENT COUNTER -------------------------------------------------------------
+
+//  T0 EXTERNAL EVENT DETECT
+//  NEGEDGE TRIGGER
+always @(posedge timer_controller_clk or negedge timer_controller_rst_n)
+begin
+   if(timer_controller_rst_n == 1'b0)
+   begin
+      sample_ext_countr_t0 <= 1'b0;
+   end
+
+   else
+   begin
+      sample_ext_countr_t0 <= timer_controller_ext_t0;
+   end
+
+end
+
+always @(posedge timer_controller_clk or negedge timer_controller_rst_n)
+begin
+   if(timer_controller_rst_n == 1'b0)
+   begin
+      sample_ext_countr_t0_shift <= 1'b0;
+   end
+
+   else
+   begin
+      sample_ext_countr_t0_shift <= sample_ext_countr_t0;
+   end
+end
+
+always @(*)
+begin
+   countr_t0_flag = (~sample_ext_countr_t0) & sample_ext_countr_t0_shift;
+end
+
+
+// ----------------------------------------------------  EXTERNAL EVENT COUNTER -------------------------------------------------------------
+
+//  T1 EXTERNAL EVENT DETECT
+//  NEGEDGE DETECTS 
+always @(posedge timer_controller_clk or negedge timer_controller_rst_n)
+begin
+   if(timer_controller_rst_n == 1'b0)
+   begin
+      sample_ext_countr_t1 <= 1'b0;
+   end
+
+   else
+   begin
+      sample_ext_countr_t1 <= timer_controller_ext_t1;
+   end
+
+end
+
+always @(posedge timer_controller_clk or negedge timer_controller_rst_n)
+begin
+   if(timer_controller_rst_n == 1'b0)
+   begin
+      sample_ext_countr_t1_shift <= 1'b0;
+   end
+
+   else
+   begin
+      sample_ext_countr_t1_shift <= sample_ext_countr_t1;
+   end
+end
+
+always @(*)
+begin
+   countr_t1_flag = (~sample_ext_countr_t1) & sample_ext_countr_t1_shift;
+end
+
+//----------------------------------------Timer 0 ------------------------------------------------------------------------------------------------------------------------------ Timer 0 BEGIN-----------------------
+
+
+always @(posedge timer_controller_clk or negedge timer_controller_rst_n)
+begin
+   if(timer_controller_rst_n == 1'b0)
+   begin
       tl0            <= 8'b0000_0000;
       th0            <= 8'b0000_0000;
       t0_overflag    <= 1'b0;
+      th0_overflow   <= 1'b0;
    end
-   else 
+
+   else
    begin
-      if((slave_wr == 1'b1 && slave_sel == 1'b1) && slave_addr == TL0_ADDR)
+      if((timer_controller_wr_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1) && timer_controller_addr == `TL0)
       begin
-         tl0  <= slave_wdata;
-         
+         tl0  <= timer_controller_wdata;
       end
-      else if((slave_wr == 1'b1 && slave_sel == 1'b1) && slave_addr == TH0_ADDR)
+      else if((timer_controller_wr_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1) && timer_controller_addr == `TH0)
       begin
-         th0  <= slave_wdata;
-      end
-
-//    GATE = 1, C/T = 0, M1 = 0, M0 = 0
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// -------NC------------NC----------NC-------NC-----------1------------0------------0-----------0-----
-//  -----------------------
-//  |  T0 M1   |  T0  M0  |
-//  -----------------------           //  13 bit Mode.
-//  |    0     |     0    |
-//  -----------------------
-
-//  |<----------------------------------------------Timer 0 TH -------------------------------------->|<---------------------------------------Timer 0 TL ---------------------------------->|
-//  |  TH0(7)  |  TH0(6)  |  TH0(5)  |  TH0(4)  |  TH0(3)  |  TH0(3)  |  TH0(2)  |  TH0(1)  |  T0(0)  | TL0(7)  |  TL0(6)  |  TL0(5)  |  TL0(4)  |  TL0(3)  |  TL0(2)  |  TL0(1)  |  TL0(0)  |
-//  |<--------------------------------------------------------------------------- USED -------------------------------------------------------------------->|<---------- UNUSED ------------>|
-// 
-
-
-      else if((t0_overflag != 1'b1) &&  (ext_trig == 1'b1 || (tcon[TCON_TR0] == 1'b1)) && (tmod[TMOD_T0_GT] == 1'b1) && (tmod[TMOD_T0_CT] == 1'b0) && (tmod[TMOD_T0_M1] == 1'b0) && (tmod[TMOD_T0_M0] == 1'b0))
-      begin
-         {t0_overflag,th0,tl0} <= {th0[TH0_ADDR],tl0[TH0_ADDR]} + 4'b1000;
+         th0  <= timer_controller_wdata;
       end
 
-//    GATE = 1, C/T = 0, M1 = 0, M0 = 1   
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// -------NC------------NC----------NC-------NC-----------1------------0------------0-----------1-----
-//  -----------------------
-//  |  T0 M1   |  T0  M0  |
-//  -----------------------         //  16 bit Mode.
-//  |    0     |     1    |
-//  -----------------------
-
-//  |<----------------------------------------------Timer 0 TH -------------------------------------->|<---------------------------------------Timer 0 TL ---------------------------------->|
-//  |  TH0(7)  |  TH0(6)  |  TH0(5)  |  TH0(4)  |  TH0(3)  |  TH0(3)  |  TH0(2)  |  TH0(1)  |  T0(0)  | TL0(7)  |  TL0(6)  |  TL0(5)  |  TL0(4)  |  TL0(3)  |  TL0(2)  |  TL0(1)  |  TL0(0)  |
-//  |<---------------------------------------------------------------------------------------------- USED ---------------------------------------------------------------------------------->|
-// 
-
-  
-      else if((t0_overflag != 1'b1) && (ext_trig == 1'b1 || (tcon[TCON_TR0] == 1'b1)) && (tmod[TMOD_T0_GT] == 1'b1) && (tmod[TMOD_T0_CT] == 1'b0) && (tmod[TMOD_T0_M1] == 1'b0) && (tmod[TMOD_T0_M0] == 1'b1)) 
+// ----------------------------------------- MODE 0 : 13-bit timer/counter (T0M1=0, T0M0=0) -----------------------------------------------------------------------------------------
+      else if(((tmod[`T0M1] == 1'b0) && (tmod[`T0M0] == 1'b0) && (hardware_gating_t0 || software_ctrl_t0) && (tmod[`CT0] ? countr_t0_flag : 1'b1)) && divide_12_clk)
       begin
-         {t0_overflag,th0,tl0} <= {th0[TH0_ADDR],tl0[TH0_ADDR]} + 1'b1;
+         if({th0,tl0[4:0]} == 13'h1FFF)
+         begin
+            {th0,tl0[4:0]} <= 13'h0000;
+            t0_overflag    <= 1'b1;
+         end
+         else
+         begin
+            {th0,tl0[4:0]} <= {th0,tl0[4:0]} + 1'b1;
+            t0_overflag    <= 1'b0;
+         end
       end
 
-//    GATE = 1, C/T = 0, M1 = 1, M0 = 0   
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// -------NC------------NC----------NC-------NC-----------1------------0------------1-----------0-----
-//  -----------------------
-//  |  T0 M1   |  T0  M0  |
-//  -----------------------         //  8 bit Auto Reload Mode.
-//  |    1     |     0    |
-//  -----------------------
-
-//  |<----------------------------------------------Timer 0 TH -------------------------------------->|<---------------------------------------Timer 0 TL ---------------------------------->|
-//  |  TH0(7)  |  TH0(6)  |  TH0(5)  |  TH0(4)  |  TH0(3)  |  TH0(3)  |  TH0(2)  |  TH0(1)  |  T0(0)  | TL0(7)  |  TL0(6)  |  TL0(5)  |  TL0(4)  |  TL0(3)  |  TL0(2)  |  TL0(1)  |  TL0(0)  |
-//  |<---------------------------------------------------------------------------------------------- USED ---------------------------------------------------------------------------------->|
-
-
-// Working
-//         -----------             -----------
-//        |  T0 TL    | --------> |  T0  TH   |--------> Overflow
-//         ------------             ----------  
-
-  
-      else if((t0_overflag != 1'b1) && (ext_trig == 1'b1 || (tcon[TCON_TR0] == 1'b1)) && (tmod[TMOD_T0_GT] == 1'b1) && (tmod[TMOD_T0_CT] == 1'b0) && (tmod[TMOD_T0_M1] == 1'b1) && (tmod[TMOD_T0_M0] == 1'b0)) 
+// -------------------------------------------- MODE 1 : 16-bit timer/counter (T0M1=0, T0M0=1) ------------------------------------------------------------------------------------------
+      else if(((tmod[`T0M1] == 1'b0) && (tmod[`T0M0] == 1'b1) &&(hardware_gating_t0 || software_ctrl_t0) && (tmod[`CT0] ? countr_t0_flag : 1'b1)) && divide_12_clk)
       begin
-         tl0               <= tl0 + 1'b1;
-         {t0_overflag,th0} <= tl0 + 1'b1;
+         if({th0,tl0} == 16'hFFFF)
+         begin
+            {th0,tl0} <= 16'h0000;
+            t0_overflag <= 1'b1;
+         end
+         else
+         begin
+            {th0,tl0} <= {th0,tl0} + 1'b1;
+            t0_overflag <= 1'b0;
+         end
       end
 
-//    GATE = 0, C/T = 0, M1 = 0, M0 = 0
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// -------NC------------NC----------NC-------NC-----------0------------0------------0-----------0-----
-//  -----------------------
-//  |  T0 M1   |  T0  M0  |
-//  -----------------------           //  13 bit Mode.
-//  |    0     |     0    |
-//  -----------------------
-
-//  |<----------------------------------------------Timer 0 TH -------------------------------------->|<---------------------------------------Timer 0 TL ---------------------------------->|
-//  |  TH0(7)  |  TH0(6)  |  TH0(5)  |  TH0(4)  |  TH0(3)  |  TH0(3)  |  TH0(2)  |  TH0(1)  |  T0(0)  | TL0(7)  |  TL0(6)  |  TL0(5)  |  TL0(4)  |  TL0(3)  |  TL0(2)  |  TL0(1)  |  TL0(0)  |
-//  |<--------------------------------------------------------------------------- USED -------------------------------------------------------------------->|<---------- UNUSED ------------>|
-//
-      else if((t0_overflag != 1'b1) && (tcon[TCON_TR0] == 1'b1) && (tmod[TMOD_T0_GT] == 1'b0) && (tmod[TMOD_T0_CT] == 1'b0) && (tmod[TMOD_T0_M1] == 1'b0) && (tmod[TMOD_T0_M0] == 1'b0))
+//----------------------------------- MODE 2 : 8-bit auto-reload (T0M1=1, T0M0=0) ---------------------------------------------------------------------------------------------------------
+      else if(((tmod[`T0M1] == 1'b1) && (tmod[`T0M0] == 1'b0) && (hardware_gating_t0 || software_ctrl_t0) && (tmod[`CT0] ? countr_t0_flag : 1'b1)) && divide_12_clk)
       begin
-         {t0_overflag,th0,tl0} <= {th0,tl0} + 4'b1000;
+         if(tl0 == 8'hFF)
+         begin
+            tl0         <= th0;
+            t0_overflag <= 1'b1;
+         end
+         else
+         begin
+            tl0         <= tl0 + 1'b1;
+            t0_overflag <= 1'b0;
+         end
       end
 
-//    GATE = 0, C/T = 0, M1 = 0, M0 = 1   
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// -------NC------------NC----------NC-------NC-----------0------------0------------0-----------1-----
-//  -----------------------
-//  |  T0 M1   |  T0  M0  |
-//  -----------------------         //  16 bit Mode.
-//  |    0     |     1    |
-//  -----------------------
-
-//  |<----------------------------------------------Timer 0 TH -------------------------------------->|<---------------------------------------Timer 0 TL ---------------------------------->|
-//  |  TH0(7)  |  TH0(6)  |  TH0(5)  |  TH0(4)  |  TH0(3)  |  TH0(3)  |  TH0(2)  |  TH0(1)  |  T0(0)  | TL0(7)  |  TL0(6)  |  TL0(5)  |  TL0(4)  |  TL0(3)  |  TL0(2)  |  TL0(1)  |  TL0(0)  |
-//  |<---------------------------------------------------------------------------------------------- USED ---------------------------------------------------------------------------------->|
-//  
-      else if((t0_overflag != 1'b1) && (tcon[TCON_TR0] == 1'b1) && (tmod[TMOD_T0_GT] == 1'b0) && (tmod[TMOD_T0_CT] == 1'b0) && (tmod[TMOD_T0_M1] == 1'b0) && (tmod[TMOD_T0_M0] == 1'b1)) 
+//------------------------------------------- MODE 3 : split 8-bit timers (T0M1=1, T0M0=1) -------------------------------------------------------------------------------------------------------
+      else if(((tmod[`T0M1] == 1'b1) && (tmod[`T0M0] == 1'b1))&& divide_12_clk)
       begin
-         {t0_overflag,th0,tl0} <= {th0,tl0} + 1'b1;   
-      end
-//    GATE = 0, C/T = 0, M1 = 1, M0 = 0
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// -------NC------------NC----------NC-------NC-----------1------------0------------1-----------0-----
-//  -----------------------
-//  |  T0 M1   |  T0  M0  |
-//  -----------------------         //  8 bit Auto Reload Mode.
-//  |    1     |     0    |
-//  -----------------------
-
-//  |<----------------------------------------------Timer 0 TH -------------------------------------->|<---------------------------------------Timer 0 TL ---------------------------------->|
-//  |  TH0(7)  |  TH0(6)  |  TH0(5)  |  TH0(4)  |  TH0(3)  |  TH0(3)  |  TH0(2)  |  TH0(1)  |  T0(0)  | TL0(7)  |  TL0(6)  |  TL0(5)  |  TL0(4)  |  TL0(3)  |  TL0(2)  |  TL0(1)  |  TL0(0)  |
-//  |<---------------------------------------------------------------------------------------------- USED ---------------------------------------------------------------------------------->|
-
-
-// Working
-//         -----------             -----------
-//        |  T0 TL    | --------> |  T0  TH   |--------> Overflow
-//         ------------             ----------  
-
-     
-      else if((t0_overflag != 1'b1) && (tcon[TCON_TR0] == 1'b1) && (tmod[TMOD_T0_GT] == 1'b0) && (tmod[TMOD_T0_CT] == 1'b0) && (tmod[TMOD_T0_M1] == 1'b1) && (tmod[TMOD_T0_M0] == 1'b0)) 
-      begin
-         tl0               <= tl0 + 1'b1;
-         {t0_overflag,th0} <= tl0 + 1'b1;  
+         // ------------------------------------ Parallelly runs ---------------------------------------------------------------------------
+         // TL0: independent 8-bit timer/counter T0
+         if((hardware_gating_t0 | software_ctrl_t0) && (tmod[`CT0] ? countr_t0_flag : 1'b1))
+         begin
+            if(tl0 == 8'hFF)
+            begin
+               tl0         <= 8'h00;
+               t0_overflag <= 1'b1;
+            end
+            else
+            begin
+               tl0         <= tl0 + 1'b1;
+               t0_overflag <= 1'b0;
+            end
+         end
+         else
+         begin
+            t0_overflag <= 1'b0;
+         end
+         // ------------------------------------ Parallelly runs ---------------------------------------------------------------------------
+         // TH0: independent 8-bit TIMER only run by TR1
+         if(tcon[`TR1-TCON_WIDTH_TIMER])
+         begin
+            if(th0 == 8'hFF)
+            begin
+               th0          <= 8'h00;
+               th0_overflow <= 1'b1;
+            end
+            else
+            begin
+               th0          <= th0 + 1'b1;
+               th0_overflow <= 1'b0;
+            end
+         end
+         else
+         begin
+            th0_overflow <= 1'b0;
+         end
       end
 
-      else if(tmod[TMOD_T0_CT] == 1'b1)
+      else
       begin
-         tl0 <= countr_tl0_reg;
-         th0 <= countr_th0_reg;
-      end 
+         t0_overflag  <= 1'b0;
+         th0_overflow <= 1'b0;
+      end
    end
 end
 
-//----------------------------------------Timer 0 ------------------------------------------------------------------------------------------------------------------------------ Timer 0 End-----------------------
 
-
-
-//----------------------------------------Timer 1 ------------------------------------------------------------------------------------------------------------------------------ Timer 1 BEGIN-----------------------
-
-//---------------------------------------- Counter 1 ---- c/t  = 1 ------------------------------------------------------------------------------------------------------- Counter 1 always block-----------------------
-
-always @(posedge t0_in or negedge rst_n)
+always @(posedge timer_controller_clk or negedge timer_controller_rst_n)
 begin
-   if(rst_n == 1'b0)
-   begin 
-      countr_tl1_reg      <= 8'b0000_0000;
-      countr_th1_reg      <= 8'b0000_0000;
-      countr_t1_overflag  <= 1'b0;
-     
-   end
-   else 
-   begin 
-
-//    GATE = 1, C/T = 1, M1 = 0, M0 = 0
-      if((countr_t1_overflag != 1'b1) &&  (ext_trig == 1'b1 || (tcon[TCON_TR1] == 1'b1)) && (tmod[TMOD_T1_GT] == 1'b1) && (tmod[TMOD_T1_CT] == 1'b1) && (tmod[TMOD_T1_M1] == 1'b0) && (tmod[TMOD_T1_M0] == 1'b0))
-      begin
-         {countr_t1_overflag,countr_th1_reg,countr_tl1_reg} <= {countr_th1_reg,countr_tl1_reg} + 4'b1000;
-      end
-
-//    GATE = 1, C/T = 1, M1 = 0, M0 = 1     
-      else if((countr_t1_overflag != 1'b1) && (ext_trig == 1'b1 || (tcon[TCON_TR1] == 1'b1)) && (tmod[TMOD_T1_GT] == 1'b1) && (tmod[TMOD_T1_CT] == 1'b1) && (tmod[TMOD_T1_M1] == 1'b0) && (tmod[TMOD_T1_M0] == 1'b1))
-      begin
-         {countr_t1_overflag,countr_th1_reg,countr_tl1_reg} <= {countr_th1_reg,countr_tl1_reg} + 1'b1;
-      end
-
-//    GATE = 1, C/T = 1, M1 = 1, M0 = 0     
-      else if((countr_t1_overflag != 1'b1) && (ext_trig == 1'b1 || (tcon[TCON_TR1] == 1'b1)) && (tmod[TMOD_T1_GT] == 1'b1) && (tmod[TMOD_T1_CT] == 1'b1) && (tmod[TMOD_T1_M1] == 1'b1) && (tmod[TMOD_T1_M0] == 1'b0))
-      begin
-         countr_tl1_reg <= countr_tl1_reg + 1'b1;
-         {countr_t1_overflag,countr_th1_reg} <= countr_tl1_reg;
-      end
-
-//    GATE = 0, C/T = 1, M1 = 0, M0 = 0
-      else if((countr_t1_overflag != 1'b1) && (tcon[TCON_TR1] == 1'b1) && (tmod[TMOD_T1_GT] == 1'b0) && (tmod[TMOD_T1_CT] == 1'b1) && (tmod[TMOD_T1_M1] == 1'b0) && (tmod[TMOD_T1_M0] == 1'b0))
-      begin
-         {countr_t1_overflag,countr_th1_reg,countr_tl1_reg} <= {countr_th1_reg,countr_tl1_reg} + 4'b1000;
-      end
-
-//    GATE = 0, C/T = 1, M1 = 0, M0 = 1     
-      else if((countr_t1_overflag != 1'b1) && (tcon[TCON_TR1] == 1'b1) && (tmod[TMOD_T1_GT] == 1'b0) && (tmod[TMOD_T1_CT] == 1'b1) && (tmod[TMOD_T1_M1] == 1'b0) && (tmod[TMOD_T1_M0] == 1'b1)) 
-      begin
-         {countr_t1_overflag,countr_th1_reg,countr_tl1_reg} <= {countr_th1_reg,countr_tl1_reg} + 1'b1;    
-      end
-
-//    GATE = 0, C/T = 1, M1 = 1, M0 = 0     
-      else if((countr_t1_overflag != 1'b1) && (tcon[TCON_TR1] == 1'b1) && (tmod[TMOD_T1_GT] == 1'b0) && (tmod[TMOD_T1_CT] == 1'b1) && (tmod[TMOD_T1_M1] == 1'b1) && (tmod[TMOD_T1_M0] == 1'b0))
-      begin
-         countr_tl1_reg <= countr_tl1_reg + 1'b1;
-         {countr_t1_overflag,countr_th1_reg} <= countr_tl1_reg;
-      end
-
-      else if(tmod[TMOD_T1_CT] == 1'b0)
-      begin
-         countr_tl1_reg   <= 8'b0000_0000;
-         countr_th1_reg   <= 8'b0000_0000;
-      end
-     
-      else if(!countr_t0_overflag)
-      begin
-         countr_tl0_reg  <= tl0;
-         countr_th0_reg  <= th0;
-      end 
-   end
-end 
-
-
-//----------------------------------------Timer 1 ---- c/t  = 0------------------------------------------------------------------------------------------------------- timer 1 always block-----------------------
-
-always @(posedge clk or negedge rst_n)
-begin
-   if(rst_n == 1'b0)
-   begin 
-      tl1          <= 8'b0000_0000;
-      th1          <= 8'b0000_0000;
-      t1_overflag  <= 1'b0;
-   end
-   else 
+   if(timer_controller_rst_n == 1'b0)
    begin
-      if((slave_wr == 1'b1 && slave_sel == 1'b1) && slave_addr == TL1_ADDR)
+      tl1            <= 8'b0000_0000;
+      th1            <= 8'b0000_0000;
+      t1_overflag    <= 1'b0;
+   end
+
+   else
+   begin
+      if((timer_controller_wr_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1) && timer_controller_addr == `TL1)
       begin
-         tl1  <= slave_wdata; 
+         tl1  <= timer_controller_wdata;
       end
 
-      else if((slave_wr == 1'b1 && slave_sel == 1'b1) && slave_addr == TH1_ADDR)
+      else if((timer_controller_wr_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1) && timer_controller_addr == `TH1)
       begin
-         th1  <= slave_wdata;
-      end
-//    GATE = 1, C/T = 0, M1 = 0, M0 = 0
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// ------1------------0-----------0---------0------------NC------------NC----------NC----------NC-----
-//  -----------------------
-//  |  T1 M1   |  T1  M0  |
-//  -----------------------           //  13 bit Mode.
-//  |    0     |     0    |
-//  -----------------------
-//  |<----------------------------------------------Timer 1 TH -------------------------------------->|<---------------------------------------Timer 1 TL ---------------------------------->|
-//  |  TH1(7)  |  TH1(6)  |  TH1(5)  |  TH1(4)  |  TH1(3)  |  TH1(3)  |  TH1(2)  |  TH1(1)  |  T1(0)  | TL1(7)  |  TL1(6)  |  TL1(5)  |  TL1(4)  |  TL1(3)  |  TL1(2)  |  TL1(1)  |  TL1(0)  |
-//  |<--------------------------------------------------------------------------- USED -------------------------------------------------------------------->|<---------- UNUSED ------------>|
-
-      if((t1_overflag != 1'b1) &&  (ext_trig == 1'b1 || (tcon[TCON_TR1] == 1'b1)) && (tmod[TMOD_T1_GT] == 1'b1) && (tmod[TMOD_T1_CT] == 1'b0) && (tmod[TMOD_T1_M1] == 1'b0) && (tmod[TMOD_T1_M0] == 1'b0))
-      begin
-         {t1_overflag,th1,tl1} <= {th1,tl1} + 4'b1000;
+         th1  <= timer_controller_wdata;
       end
 
-//    GATE = 1, C/T = 0, M1 = 0, M0 = 1    
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// ------1------------0-----------0----------1------------NC------------NC----------NC----------NC----
-//  -----------------------
-//  |  T1 M1   |  T1  M0  |
-//  -----------------------         //  16 bit Mode.
-//  |    0     |     1    |
-//  -----------------------
-
-//  |<----------------------------------------------Timer 1 TH -------------------------------------->|<---------------------------------------Timer 1 TL ---------------------------------->|
-//  |  TH1(7)  |  TH1(6)  |  TH1(5)  |  TH1(4)  |  TH1(3)  |  TH1(3)  |  TH1(2)  |  TH1(1)  |  T1(0)  | TL1(7)  |  TL1(6)  |  TL1(5)  |  TL1(4)  |  TL1(3)  |  TL1(2)  |  TL1(1)  |  TL1(0)  |
-//  |<---------------------------------------------------------------------------------------------- USED ---------------------------------------------------------------------------------->|
- 
-      else if((t1_overflag != 1'b1) && (ext_trig == 1'b1 || (tcon[TCON_TR1] == 1'b1)) && (tmod[TMOD_T1_GT] == 1'b1) && (tmod[TMOD_T1_CT] == 1'b0) && (tmod[TMOD_T1_M1] == 1'b0) && (tmod[TMOD_T1_M0] == 1'b1)) 
+//-------------------------------- MODE 0 : 13-bit timer/counter (T1M1=0, T1M0=0) -------------------------------------------------------------------
+      else if(((tmod[`T1M1] == 1'b0) && (tmod[`T1M0] == 1'b0) && (hardware_gating_t1 || software_ctrl_t1) && (tmod[`CT1] ? countr_t1_flag : 1'b1)) && divide_12_clk)
       begin
-         {t1_overflag,th1,tl1} <= {th1,tl1} + 1'b1;
+         if({th1,tl1[4:0]} == 13'h1FFF)
+         begin
+            {th1,tl1[4:0]} <= 13'h0000;
+            t1_overflag    <= 1'b1;
+         end
+         else
+         begin
+            {th1,tl1[4:0]} <= {th1,tl1[4:0]} + 1'b1;
+            t1_overflag    <= 1'b0;
+         end
       end
 
-
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// ------1------------0-----------1---------0------------NC------------NC----------NC----------NC-----
-//  -----------------------
-//  |  T0 M1   |  T0  M0  |
-//  -----------------------         //  8 bit Auto Reload Mode.
-//  |    1     |     0    |
-//  -----------------------
-
-//  |<----------------------------------------------Timer 1 TH -------------------------------------->|<---------------------------------------Timer 1 TL ---------------------------------->|
-//  |  TH1(7)  |  TH1(6)  |  TH1(5)  |  TH1(4)  |  TH1(3)  |  TH1(3)  |  TH1(2)  |  TH1(1)  |  T1(0)  | TL1(7)  |  TL1(6)  |  TL1(5)  |  TL1(4)  |  TL1(3)  |  TL1(2)  |  TL1(1)  |  TL1(0)  |
-//  |<---------------------------------------------------------------------------------------------- USED ---------------------------------------------------------------------------------->|
-
-
-// Working
-//         -----------             -----------
-//        |  T1 TL    | --------> |  T1  TH   |--------> Overflow  
-//         -----------             -----------
-   
-      else if((t1_overflag != 1'b1) && (ext_trig == 1'b1 || (tcon[TCON_TR1] == 1'b1)) && (tmod[TMOD_T1_GT] == 1'b1) && (tmod[TMOD_T1_CT] == 1'b0) && (tmod[TMOD_T1_M1] == 1'b1) && (tmod[TMOD_T1_M0] == 1'b0)) 
+//------------------------------- MODE 1 : 16-bit timer/counter (T1M1=0, T1M0=1) ----------------------------------------------------------------------
+      else if(((tmod[`T1M1] == 1'b0) && (tmod[`T1M0] == 1'b1) && (hardware_gating_t1 || software_ctrl_t1) && (tmod[`CT1] ? countr_t1_flag : 1'b1))&& divide_12_clk)
       begin
-         tl1               <= tl1 + 1'b1;
-         {t1_overflag,th1} <= tl1 + 1'b1;
+         if({th1,tl1} == 16'hFFFF)
+         begin
+            {th1,tl1} <= 16'h0000;
+            t1_overflag <= 1'b1;
+         end
+         else
+         begin
+            {th1,tl1} <= {th1,tl1} + 1'b1;
+            t1_overflag <= 1'b0;
+         end
       end
 
-//    GATE = 0, C/T = 0, M1 = 0, M0 = 0
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// ------0------------0-----------0---------0------------NC------------NC----------NC----------NC-----
-//  -----------------------
-//  |  T1 M1   |  T1  M0  |
-//  -----------------------           //  13 bit Mode.
-//  |    0     |     0    |
-//  -----------------------
-//  |<----------------------------------------------Timer 1 TH -------------------------------------->|<---------------------------------------Timer 1 TL ---------------------------------->|
-//  |  TH1(7)  |  TH1(6)  |  TH1(5)  |  TH1(4)  |  TH1(3)  |  TH1(3)  |  TH1(2)  |  TH1(1)  |  T1(0)  | TL1(7)  |  TL1(6)  |  TL1(5)  |  TL1(4)  |  TL1(3)  |  TL1(2)  |  TL1(1)  |  TL1(0)  |
-//  |<--------------------------------------------------------------------------- USED -------------------------------------------------------------------->|<---------- UNUSED ------------>|
-      
-      else if((t1_overflag != 1'b1) && (tcon[TCON_TR1] == 1'b1) && (tmod[TMOD_T1_GT] == 1'b0) && (tmod[TMOD_T1_CT] == 1'b0) && (tmod[TMOD_T1_M1] == 1'b0) && (tmod[TMOD_T1_M0] == 1'b0))
+// ------------------------------- MODE 2 : 8-bit auto-reload (T1M1=1, T1M0=0) ---------------------------------------------------------------------
+      else if(((tmod[`T1M1] == 1'b1) && (tmod[`T1M0] == 1'b0) && (hardware_gating_t1 || software_ctrl_t1) && (tmod[`CT1] ? countr_t1_flag : 1'b1)) && divide_12_clk)
       begin
-         {t1_overflag,th1,tl1} <= {th1,tl1} + 4'b1000;
+         if(tl1 == 8'hFF)
+         begin
+            tl1         <= th1;
+            t1_overflag <= 1'b1;
+         end
+         else
+         begin
+            tl1         <= tl1 + 1'b1;
+            t1_overflag <= 1'b0;
+         end
       end
 
-
-//    GATE = 0, C/T = 0, M1 = 0, M0 = 1  
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// ------0------------0-----------0----------1------------NC------------NC----------NC----------NC----
-//  -----------------------
-//  |  T1 M1   |  T1  M0  |
-//  -----------------------         //  16 bit Mode.
-//  |    0     |     1    |
-//  -----------------------
-
-//  |<----------------------------------------------Timer 1 TH -------------------------------------->|<---------------------------------------Timer 1 TL ---------------------------------->|
-//  |  TH1(7)  |  TH1(6)  |  TH1(5)  |  TH1(4)  |  TH1(3)  |  TH1(3)  |  TH1(2)  |  TH1(1)  |  T1(0)  | TL1(7)  |  TL1(6)  |  TL1(5)  |  TL1(4)  |  TL1(3)  |  TL1(2)  |  TL1(1)  |  TL1(0)  |
-//  |<---------------------------------------------------------------------------------------------- USED ---------------------------------------------------------------------------------->|
- 
-      else if((t1_overflag != 1'b1) && (tcon[TCON_TR1] == 1'b1) && (tmod[TMOD_T1_GT] == 1'b0) && (tmod[TMOD_T1_CT] == 1'b0) && (tmod[TMOD_T1_M1] == 1'b0) && (tmod[TMOD_T1_M0] == 1'b1)) 
+      else
       begin
-         {t1_overflag,th1,tl1} <= {th1,tl1} + 1'b1;    
+         t1_overflag <= 1'b0;
       end
-
-//    GATE = 0, C/T = 0, M1 = 1, M0 = 0    
-// -------7------------6------------5--------4-----------3-------------2------------1----------0------
-// |   T1 Gate   |   T1 C/T   |   T1M1  |   T1M0   |  T0 Gate   |   T0 C/T   |   T0 M1   |   T0 M0   |
-// ---------------------------------------------------------------------------------------------------
-// ------0------------0-----------1---------0------------NC------------NC----------NC----------NC-----
-//  -----------------------
-//  |  T0 M1   |  T0  M0  |
-//  -----------------------         //  8 bit Auto Reload Mode.
-//  |    1     |     0    |
-//  -----------------------
-
-//  |<----------------------------------------------Timer 1 TH -------------------------------------->|<---------------------------------------Timer 1 TL ---------------------------------->|
-//  |  TH1(7)  |  TH1(6)  |  TH1(5)  |  TH1(4)  |  TH1(3)  |  TH1(3)  |  TH1(2)  |  TH1(1)  |  T1(0)  | TL1(7)  |  TL1(6)  |  TL1(5)  |  TL1(4)  |  TL1(3)  |  TL1(2)  |  TL1(1)  |  TL1(0)  |
-//  |<---------------------------------------------------------------------------------------------- USED ---------------------------------------------------------------------------------->|
-
-
-// Working
-//         -----------             -----------
-//        |  T1 TL    | --------> |  T1  TH   |--------> Overflow  
-//         -----------             -----------
-
-      else if((t1_overflag != 1'b1) && (tcon[TCON_TR1] == 1'b1) && (tmod[TMOD_T1_GT] == 1'b0) && (tmod[TMOD_T1_CT] == 1'b0) && (tmod[TMOD_T1_M1] == 1'b1) && (tmod[TMOD_T1_M0] == 1'b0)) 
-      begin
-         tl1               <= tl1 + 1'b1;
-         {t1_overflag,th1} <= tl1 + 1'b1;    
-      end
-  
-      else if(tmod[TMOD_T0_CT] == 1'b1)
-      begin
-         tl0 <= countr_tl0_reg;
-         th0 <= countr_th0_reg;
-      end 
    end
 end
 
-//----------------------------------------Timer 1 ------------------------------------------------------------------------------------------------------------------------------ Timer 1 End-----------------------
 
 
-// ----------------------------------- READ -------------------------------------------------------------------------------------------------------------------------------------- READ --------------------
+// ----------------------------------- REGISTER READ -----------------------------------------------------------------------------------------------------------------------------------REGISTER READ --------------------
 always @(*)
-begin 
+begin
 
-   if(slave_wr == 1'b0 && slave_sel == 1'b1 && slave_addr == TMOD)                        // READ TMOD
+   if(timer_controller_rd_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1 && timer_controller_addr == `TMOD)                        // READ TMOD
    begin
-      slave_rdata = tmod;
-   end
-    
-   else if(slave_wr == 1'b0 && slave_sel == 1'b1 && slave_addr == TCON)                    // READ TCON
-   begin
-      slave_rdata = tcon;
+      timer_controller_rdata = tmod;
    end
 
-   else if(slave_wr == 1'b0 && slave_sel == 1'b1 && slave_addr == TL0_ADDR)                   // READ TL0
+   else if(!timer_controller_bit_nbyte_addr && (timer_controller_rd_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1 && timer_controller_addr == `TCON))                 // READ TCON
    begin
-      slave_rdata = tl0;
-   end
-   
-   else if(slave_wr == 1'b0 && slave_sel == 1'b1 && slave_addr == TH0_ADDR)                   // READ TH0
-   begin
-      slave_rdata = th0;
-   end
-   
-   else if(slave_wr == 1'b0 && slave_sel == 1'b1 && slave_addr == TL1_ADDR)                   // READ TL1
-   begin
-      slave_rdata = tl1;
-   end
-   
-   else if(slave_wr == 1'b0 && slave_sel == 1'b1 && slave_addr == TH1_ADDR)                  // READ TH1
-   begin
-      slave_rdata = th1;
+      timer_controller_rdata = {tcon,4'b0000};
    end
 
-   else 
+   else if(timer_controller_bit_nbyte_addr && (timer_controller_rd_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1 && timer_controller_addr == `TCON)&& (timer_controller_bit_addr > (TCON_WIDTH_TIMER-1)))   // READ TCON
    begin
-      slave_rdata = 8'b0000_0000;
+      timer_controller_rdata  = {7'b000_0000,tcon[timer_controller_bit_addr-TCON_WIDTH_TIMER]};
+   end
+
+   else if(timer_controller_rd_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1 && timer_controller_addr == `TL0)                   // READ TL0
+   begin
+      timer_controller_rdata = tl0;
+   end
+
+   else if(timer_controller_rd_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1 && timer_controller_addr == `TH0)                   // READ TH0
+   begin
+      timer_controller_rdata = th0;
+   end
+
+   else if(timer_controller_rd_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1 && timer_controller_addr == `TL1)                   // READ TL1
+   begin
+      timer_controller_rdata = tl1;
+   end
+
+   else if(timer_controller_rd_en == 1'b1 && timer_controller_sel_intrnl_reg == 1'b1 && timer_controller_addr == `TH1)                  // READ TH1
+   begin
+      timer_controller_rdata = th1;
+   end
+
+   else
+   begin
+      timer_controller_rdata = {REGISTER_WIDTH{1'b0}};
    end
 end
 
-endmodule 
+
+always @(*)
+begin
+   timer_controller_t0_flag = tcon[`TF0-TCON_WIDTH_TIMER];
+   timer_controller_t1_flag = tcon[`TF1-TCON_WIDTH_TIMER];
+end
+
+endmodule
